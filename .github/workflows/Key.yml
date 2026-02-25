@@ -1,0 +1,375 @@
+# ┌──────────────────────────────────────────────────────────────────┐
+# │  ONE-TIME WORKFLOW: Generate Android Signing Keystore            │
+# │                                                                  │
+# │  Generates a JKS keystore, base64-encodes it, and either:       │
+# │    • Auto-saves all 4 secrets (if ADMIN_PAT secret exists), or   │
+# │    • Uploads an encrypted artifact for manual secret setup.      │
+# │                                                                  │
+# │  Run once from: Actions tab → "Generate Signing Key" → Run      │
+# └──────────────────────────────────────────────────────────────────┘
+name: "🔑 Generate Signing Key"
+
+on:
+  workflow_dispatch:
+    inputs:
+      key_alias:
+        description: 'Key alias name'
+        required: false
+        default: 'linux-deploy-key'
+        type: string
+      key_validity_years:
+        description: 'Key validity (years)'
+        required: false
+        default: '25'
+        type: string
+      cn:
+        description: 'Common Name (your name or org)'
+        required: false
+        default: 'Linux Deploy Developer'
+        type: string
+      ou:
+        description: 'Organizational Unit'
+        required: false
+        default: 'Mobile Development'
+        type: string
+      org:
+        description: 'Organization'
+        required: false
+        default: 'Independent'
+        type: string
+      city:
+        description: 'City / Locality'
+        required: false
+        default: 'Unknown'
+        type: string
+      state:
+        description: 'State / Province'
+        required: false
+        default: 'Unknown'
+        type: string
+      country:
+        description: 'Country code (2 letters, e.g. US, DE, RU)'
+        required: false
+        default: 'US'
+        type: string
+      key_size:
+        description: 'RSA key size (bits)'
+        required: false
+        default: '4096'
+        type: choice
+        options:
+          - '2048'
+          - '4096'
+      artifact_password:
+        description: 'Password to encrypt the downloadable artifact (leave blank to auto-generate)'
+        required: false
+        default: ''
+        type: string
+      auto_set_secrets:
+        description: 'Auto-set repository secrets (requires ADMIN_PAT secret with repo scope)'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  generate-key:
+    name: Generate Keystore & Configure Secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      # ── 1. Generate cryptographically strong passwords ──
+      - name: Generate passwords
+        id: passwords
+        run: |
+          KEYSTORE_PASSWORD=$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9!@#%^&*' | head -c 32)
+          KEY_PASSWORD=$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9!@#%^&*' | head -c 32)
+
+          # Mask them from logs immediately
+          echo "::add-mask::$KEYSTORE_PASSWORD"
+          echo "::add-mask::$KEY_PASSWORD"
+
+          echo "keystore_password=$KEYSTORE_PASSWORD" >> "$GITHUB_OUTPUT"
+          echo "key_password=$KEY_PASSWORD" >> "$GITHUB_OUTPUT"
+
+          # Artifact encryption password
+          if [ -n "${{ inputs.artifact_password }}" ]; then
+            ARTIFACT_PASS="${{ inputs.artifact_password }}"
+          else
+            ARTIFACT_PASS=$(openssl rand -base64 16 | tr -dc 'A-Za-z0-9' | head -c 16)
+          fi
+          echo "::add-mask::$ARTIFACT_PASS"
+          echo "artifact_password=$ARTIFACT_PASS" >> "$GITHUB_OUTPUT"
+
+      # ── 2. Generate the JKS keystore ──
+      - name: Generate keystore
+        id: keygen
+        env:
+          KEYSTORE_PASSWORD: ${{ steps.passwords.outputs.keystore_password }}
+          KEY_PASSWORD: ${{ steps.passwords.outputs.key_password }}
+          KEY_ALIAS: ${{ inputs.key_alias }}
+        run: |
+          VALIDITY_DAYS=$(( ${{ inputs.key_validity_years }} * 365 ))
+          DNAME="CN=${{ inputs.cn }}, OU=${{ inputs.ou }}, O=${{ inputs.org }}, L=${{ inputs.city }}, ST=${{ inputs.state }}, C=${{ inputs.country }}"
+
+          echo "Generating RSA ${{ inputs.key_size }}-bit keystore..."
+          echo "  Alias:    $KEY_ALIAS"
+          echo "  Validity: $VALIDITY_DAYS days (${{ inputs.key_validity_years }} years)"
+          echo "  DN:       $DNAME"
+
+          keytool -genkeypair \
+            -alias "$KEY_ALIAS" \
+            -keyalg RSA \
+            -keysize ${{ inputs.key_size }} \
+            -sigalg SHA256withRSA \
+            -validity "$VALIDITY_DAYS" \
+            -dname "$DNAME" \
+            -keystore release-keystore.jks \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -keypass "$KEY_PASSWORD" \
+            -storetype JKS
+
+          echo ""
+          echo "Keystore generated. Details:"
+          keytool -list -v \
+            -keystore release-keystore.jks \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -alias "$KEY_ALIAS" 2>&1 | grep -E '(Alias|Creation|Valid|Certificate fingerprints|SHA256|SHA1|MD5|Key size)'
+
+          # Get fingerprints for summary
+          SHA256=$(keytool -list -v \
+            -keystore release-keystore.jks \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -alias "$KEY_ALIAS" 2>&1 | grep "SHA256:" | awk '{print $2}')
+          SHA1=$(keytool -list -v \
+            -keystore release-keystore.jks \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -alias "$KEY_ALIAS" 2>&1 | grep "SHA1:" | awk '{print $2}')
+
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "sha1=$SHA1" >> "$GITHUB_OUTPUT"
+
+      # ── 3. Base64-encode the keystore ──
+      - name: Base64-encode keystore
+        id: encode
+        env:
+          KEYSTORE_PASSWORD: ${{ steps.passwords.outputs.keystore_password }}
+        run: |
+          KEYSTORE_BASE64=$(base64 -w 0 release-keystore.jks)
+          echo "::add-mask::$KEYSTORE_BASE64"
+          echo "keystore_base64=$KEYSTORE_BASE64" >> "$GITHUB_OUTPUT"
+
+          # File size for reference
+          FILESIZE=$(du -h release-keystore.jks | cut -f1)
+          B64SIZE=$(echo -n "$KEYSTORE_BASE64" | wc -c)
+          echo "file_size=$FILESIZE" >> "$GITHUB_OUTPUT"
+          echo "b64_length=$B64SIZE" >> "$GITHUB_OUTPUT"
+
+      # ── 4. Try auto-setting repository secrets ──
+      - name: Check for ADMIN_PAT
+        id: pat-check
+        run: |
+          if [ -n "${{ secrets.ADMIN_PAT }}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Auto-set repository secrets
+        if: inputs.auto_set_secrets && steps.pat-check.outputs.available == 'true'
+        id: auto-secrets
+        env:
+          GH_TOKEN: ${{ secrets.ADMIN_PAT }}
+          KEYSTORE_BASE64: ${{ steps.encode.outputs.keystore_base64 }}
+          KEYSTORE_PASSWORD: ${{ steps.passwords.outputs.keystore_password }}
+          KEY_ALIAS: ${{ inputs.key_alias }}
+          KEY_PASSWORD: ${{ steps.passwords.outputs.key_password }}
+        run: |
+          echo "Setting KEYSTORE_BASE64..."
+          echo "$KEYSTORE_BASE64" | gh secret set KEYSTORE_BASE64 --repo "$GITHUB_REPOSITORY"
+
+          echo "Setting KEYSTORE_PASSWORD..."
+          echo "$KEYSTORE_PASSWORD" | gh secret set KEYSTORE_PASSWORD --repo "$GITHUB_REPOSITORY"
+
+          echo "Setting KEY_ALIAS..."
+          echo "$KEY_ALIAS" | gh secret set KEY_ALIAS --repo "$GITHUB_REPOSITORY"
+
+          echo "Setting KEY_PASSWORD..."
+          echo "$KEY_PASSWORD" | gh secret set KEY_PASSWORD --repo "$GITHUB_REPOSITORY"
+
+          echo "✅ All 4 secrets configured successfully!"
+          echo "secrets_set=true" >> "$GITHUB_OUTPUT"
+
+      - name: Secrets auto-set status
+        if: inputs.auto_set_secrets && steps.pat-check.outputs.available != 'true'
+        run: |
+          echo "::warning::ADMIN_PAT secret not found. Cannot auto-set secrets."
+          echo "Upload your PAT as ADMIN_PAT secret (needs 'repo' scope) to enable auto-configuration."
+          echo "Falling back to encrypted artifact download."
+
+      # ── 5. Create encrypted artifact for manual setup ──
+      - name: Create secrets bundle
+        if: steps.auto-secrets.outputs.secrets_set != 'true'
+        env:
+          KEYSTORE_BASE64: ${{ steps.encode.outputs.keystore_base64 }}
+          KEYSTORE_PASSWORD: ${{ steps.passwords.outputs.keystore_password }}
+          KEY_ALIAS: ${{ inputs.key_alias }}
+          KEY_PASSWORD: ${{ steps.passwords.outputs.key_password }}
+          ARTIFACT_PASS: ${{ steps.passwords.outputs.artifact_password }}
+        run: |
+          mkdir -p signing-bundle
+
+          # Write individual secret files
+          echo "$KEYSTORE_BASE64"    > signing-bundle/KEYSTORE_BASE64.txt
+          echo "$KEYSTORE_PASSWORD"  > signing-bundle/KEYSTORE_PASSWORD.txt
+          echo "$KEY_ALIAS"          > signing-bundle/KEY_ALIAS.txt
+          echo "$KEY_PASSWORD"       > signing-bundle/KEY_PASSWORD.txt
+
+          # Also include the raw .jks for local use
+          cp release-keystore.jks signing-bundle/
+
+          # Write setup instructions
+          cat > signing-bundle/README.txt << 'INSTRUCTIONS'
+          ╔══════════════════════════════════════════════════════════════╗
+          ║         ANDROID SIGNING KEY — SETUP INSTRUCTIONS            ║
+          ╠══════════════════════════════════════════════════════════════╣
+          ║                                                              ║
+          ║  Go to your GitHub repository:                               ║
+          ║    Settings → Secrets and variables → Actions → Secrets      ║
+          ║                                                              ║
+          ║  Create these 4 repository secrets:                          ║
+          ║                                                              ║
+          ║  ┌─────────────────────┬───────────────────────────────┐     ║
+          ║  │ Secret Name         │ Value (from file)             │     ║
+          ║  ├─────────────────────┼───────────────────────────────┤     ║
+          ║  │ KEYSTORE_BASE64     │ KEYSTORE_BASE64.txt           │     ║
+          ║  │ KEYSTORE_PASSWORD   │ KEYSTORE_PASSWORD.txt         │     ║
+          ║  │ KEY_ALIAS           │ KEY_ALIAS.txt                 │     ║
+          ║  │ KEY_PASSWORD        │ KEY_PASSWORD.txt              │     ║
+          ║  └─────────────────────┴───────────────────────────────┘     ║
+          ║                                                              ║
+          ║  Copy the ENTIRE content of each .txt file as the value.     ║
+          ║                                                              ║
+          ║  ⚠️  DELETE this bundle after configuring secrets!            ║
+          ║  ⚠️  NEVER commit these files to your repository!            ║
+          ║                                                              ║
+          ║  The release-keystore.jks file is included for local         ║
+          ║  Android Studio signing. Store it securely outside git.      ║
+          ║                                                              ║
+          ╚══════════════════════════════════════════════════════════════╝
+          INSTRUCTIONS
+
+          # Encrypt the bundle with gpg
+          tar czf signing-bundle.tar.gz -C signing-bundle .
+          gpg --batch --yes --symmetric \
+            --cipher-algo AES256 \
+            --passphrase "$ARTIFACT_PASS" \
+            --output signing-bundle.tar.gz.gpg \
+            signing-bundle.tar.gz
+
+          echo "Encrypted bundle created."
+
+      - name: Upload encrypted signing bundle
+        if: steps.auto-secrets.outputs.secrets_set != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: signing-bundle-encrypted
+          path: signing-bundle.tar.gz.gpg
+          retention-days: 1
+          if-no-files-found: error
+
+      # ── 6. Job summary ──
+      - name: Write job summary
+        env:
+          ARTIFACT_PASS: ${{ steps.passwords.outputs.artifact_password }}
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << SUMMARY
+
+          # 🔑 Signing Key Generated
+
+          ## Keystore Details
+
+          | Property | Value |
+          |----------|-------|
+          | **Algorithm** | RSA ${{ inputs.key_size }}-bit |
+          | **Signature** | SHA256withRSA |
+          | **Alias** | \`${{ inputs.key_alias }}\` |
+          | **Validity** | ${{ inputs.key_validity_years }} years |
+          | **DN** | CN=${{ inputs.cn }}, OU=${{ inputs.ou }}, O=${{ inputs.org }}, C=${{ inputs.country }} |
+          | **SHA-256** | \`${{ steps.keygen.outputs.sha256 }}\` |
+          | **SHA-1** | \`${{ steps.keygen.outputs.sha1 }}\` |
+          | **Keystore size** | ${{ steps.encode.outputs.file_size }} |
+
+          SUMMARY
+
+          if [ "${{ steps.auto-secrets.outputs.secrets_set }}" = "true" ]; then
+            cat >> "$GITHUB_STEP_SUMMARY" << 'AUTO'
+
+          ## ✅ Secrets Auto-Configured
+
+          All 4 repository secrets have been set automatically:
+          - `KEYSTORE_BASE64` ✅
+          - `KEYSTORE_PASSWORD` ✅
+          - `KEY_ALIAS` ✅
+          - `KEY_PASSWORD` ✅
+
+          **You're ready to build signed releases!** Push a version tag:
+          ```bash
+          git tag v1.0.0
+          git push origin v1.0.0
+          ```
+          AUTO
+          else
+            cat >> "$GITHUB_STEP_SUMMARY" << MANUAL
+
+          ## 📦 Manual Setup Required
+
+          ### Step 1: Download the artifact
+          Download \`signing-bundle-encrypted\` from the Artifacts section below.
+
+          ### Step 2: Decrypt it
+          \`\`\`bash
+          gpg --decrypt --output signing-bundle.tar.gz signing-bundle.tar.gz.gpg
+          # Password: ${ARTIFACT_PASS}
+
+          tar xzf signing-bundle.tar.gz
+          \`\`\`
+
+          ### Step 3: Set the 4 repository secrets
+          Go to **Settings → Secrets and variables → Actions** and create:
+
+          | Secret | Source file |
+          |--------|------------|
+          | \`KEYSTORE_BASE64\` | Content of \`KEYSTORE_BASE64.txt\` |
+          | \`KEYSTORE_PASSWORD\` | Content of \`KEYSTORE_PASSWORD.txt\` |
+          | \`KEY_ALIAS\` | Content of \`KEY_ALIAS.txt\` |
+          | \`KEY_PASSWORD\` | Content of \`KEY_PASSWORD.txt\` |
+
+          ### Step 4: Clean up
+          \`\`\`bash
+          rm -rf signing-bundle* KEYSTORE_* KEY_* release-keystore.jks
+          \`\`\`
+
+          > ⚠️ **The artifact expires in 24 hours. The decryption password is shown above only once.**
+
+          ### Optional: Enable auto-setup for next time
+          Create an \`ADMIN_PAT\` repository secret containing a GitHub Personal Access Token
+          with \`repo\` scope. Future runs will set secrets automatically.
+          MANUAL
+          fi
+
+      # ── 7. Security cleanup ──
+      - name: Secure cleanup
+        if: always()
+        run: |
+          echo "Shredding sensitive files..."
+          if command -v shred &> /dev/null; then
+            shred -vfz -n 3 release-keystore.jks 2>/dev/null || true
+            shred -vfz -n 3 signing-bundle.tar.gz 2>/dev/null || true
+            find signing-bundle/ -type f -exec shred -vfz -n 3 {} \; 2>/dev/null || true
+          fi
+          rm -rf release-keystore.jks signing-bundle/ signing-bundle.tar.gz
+          echo "✅ Cleanup complete"
