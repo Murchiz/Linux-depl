@@ -31,33 +31,29 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      # ── Generate Gradle wrapper if absent ──
       - name: Check for Gradle wrapper
         id: wrapper-check
         run: |
           if [ -f "gradlew" ] && [ -f "gradle/wrapper/gradle-wrapper.jar" ]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "✅ Gradle wrapper found"
+            echo "generated=false" >> "$GITHUB_OUTPUT"
           else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "⚠️  Gradle wrapper NOT found — will generate"
+            echo "generated=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Install Gradle for wrapper generation
-        if: steps.wrapper-check.outputs.exists == 'false'
+        if: steps.wrapper-check.outputs.generated == 'true'
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: ${{ env.GRADLE_VERSION }}
+          validate-wrappers: false
 
       - name: Generate Gradle wrapper
-        if: steps.wrapper-check.outputs.exists == 'false'
+        if: steps.wrapper-check.outputs.generated == 'true'
         run: |
           gradle wrapper --gradle-version "${{ env.GRADLE_VERSION }}" --distribution-type bin
           chmod +x gradlew
-          echo "### ⚙️ Gradle wrapper generated (v${{ env.GRADLE_VERSION }})" >> "$GITHUB_STEP_SUMMARY"
-          echo "Consider committing wrapper files to the repo." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Ensure gradlew is executable
+      - name: Fix gradlew permissions
         run: chmod +x gradlew
 
       - uses: android-actions/setup-android@v3
@@ -73,6 +69,7 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
         with:
+          validate-wrappers: false
           cache-read-only: true
 
       - name: Compile Debug
